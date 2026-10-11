@@ -44,15 +44,12 @@ jobs:
           
       - name: Processing submodules
         run: |
-          git submodule update --init --remote --rebase --recursive android/Installer
-          git submodule update --init --remote --rebase --recursive Baseband-guard
-          git submodule update --init --remote --rebase --recursive KernelSU
-          cd KernelSU
-          git fetch --tags
-          LATEST_TAG=$(git tag -l | sort -V | tail -n1)
-          git checkout $LATEST_TAG
-          #sed -i -e '$a\'$'\n''CONFIG_KSU=y\nCONFIG_KSU_TAMPER_SYSCALL_TABLE=y\nCONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED=y' ../arch/arm64/configs/alioth_kosminor_defconfig
-          sed -i -e '$a\'$'\n''CONFIG_USER_NS=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_CGROUP_DEVICE=y' ../arch/arm64/configs/alioth_kosminor_defconfig
+          git submodule update --init --recursive android/Installer
+          git submodule update --init --recursive Baseband-guard
+          git submodule update --init --recursive utils
+          sed -i -e '$a\'$'\n''# CONFIG_KSU is not set\nCONFIG_USER_NS=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_CGROUP_DEVICE=y' arch/arm64/configs/alioth_kosminor_defconfig
+          echo "=== 配置确认 ==="
+          grep -E "CONFIG_KSU|CONFIG_USER_NS|CONFIG_CGROUP_PIDS|CONFIG_CGROUP_DEVICE" arch/arm64/configs/alioth_kosminor_defconfig || true
           
       - name: Build Kernel
         run: |
