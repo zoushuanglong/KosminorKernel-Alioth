@@ -46,7 +46,6 @@ jobs:
         run: |
           git submodule update --init --recursive android/Installer
           git submodule update --init --recursive Baseband-guard
-          git submodule update --init --recursive utils
           sed -i -e '$a\'$'\n''# CONFIG_KSU is not set\nCONFIG_USER_NS=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_CGROUP_DEVICE=y' arch/arm64/configs/alioth_kosminor_defconfig
           echo "=== 配置确认 ==="
           grep -E "CONFIG_KSU|CONFIG_USER_NS|CONFIG_CGROUP_PIDS|CONFIG_CGROUP_DEVICE" arch/arm64/configs/alioth_kosminor_defconfig || true
