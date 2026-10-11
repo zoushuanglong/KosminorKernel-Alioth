@@ -3,6 +3,7 @@ on:
   push:
     tags:
       - "C-*"
+  workflow_dispatch:
 
 jobs:
   build:
