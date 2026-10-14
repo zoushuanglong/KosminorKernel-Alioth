@@ -20,7 +20,7 @@ jobs:
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 5
-          
+
       - name: Get Tag Name
         id: get-tag
         run: |
@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install git automake build-essential bc -y
           echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%Y%m%d%H%M")" >> $GITHUB_ENV
-          
+
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -41,16 +41,66 @@ jobs:
         run: |
           git clone https://gitlab.com/ThankYouMario/android_prebuilts_clang-standalone.git --depth 1 toolchain/llvm
           git clone https://github.com/KopsourcesORG/python-2.7.18-prebuilt.git --depth=1 toolchain/python2
-          
+
       - name: Processing submodules
         run: |
           git submodule update --init --recursive android/Installer
           git submodule update --init --recursive Baseband-guard
           git submodule update --init --recursive KernelSU
-          sed -i -e '$a\'$'\n''# CONFIG_KSU is not set\nCONFIG_USER_NS=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_CGROUP_DEVICE=y\nCONFIG_PID_NS=y\nCONFIG_IPC_NS=y\nCONFIG_POSIX_MQUEUE=y\nCONFIG_BRIDGE_NETFILTER=y\nCONFIG_NETFILTER_XTABLES=y\nCONFIG_IP_TABLES=y\nCONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y\nCONFIG_NETFILTER_XT_MATCH_IPVS=y\nCONFIG_IP6_NF_NAT=y\nCONFIG_IP6_NF_TARGET_MASQUERADE=y\nCONFIG_IPVLAN=y\nCONFIG_MACVLAN=y\nCONFIG_IP_NF_TARGET_REJECT=y\nCONFIG_NETFILTER_XT_TARGET_MASQUERADE=y\nCONFIG_NETFILTER_XT_NAT=y\nCONFIG_KVM=y\nCONFIG_VIRTUALIZATION=y' arch/arm64/configs/alioth_kosminor_defconfig
-          echo "=== 配置确认 ==="
-          grep -E "CONFIG_KSU|CONFIG_USER_NS|CONFIG_CGROUP_PIDS|CONFIG_CGROUP_DEVICE" arch/arm64/configs/alioth_kosminor_defconfig || true
-          
+
+      # ==========================================================================
+      # chroot 真 Linux + 原生 dockerd 所需的内核编译参数
+      #
+      # 追加到 defconfig 末尾：Kconfig 解析时后写的覆盖先写的，因此这里等于
+      # 「强制覆盖」基线里的同名项。
+      #
+      # 全部用 =y：本内核 STATIC_USERMODEHELPER 被重定向到 /system/bin/micd，
+      # 用户态 modprobe / 自动加载被劫持，任何 =m 的模块都不会被加载。
+      # ==========================================================================
+      - name: Patch Kernel Config for Docker
+        run: |
+          cat >> arch/arm64/configs/alioth_kosminor_defconfig <<'KCONFIG'
+
+          # ===== chroot + 原生 dockerd (Linux 4.19 / alioth) =====
+          # --- 必需：namespace / IPC ---
+          CONFIG_PID_NS=y
+          CONFIG_IPC_NS=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_SYSVIPC=y
+          CONFIG_SYSVIPC_SYSCTL=y
+          # --- 必需：cgroup 控制器 ---
+          # Android init 的 cgroups.json 不含 devices/pids，不会挂载这两个控制器，
+          # 需要 chroot 内手动挂 /sys/fs/cgroup/{devices,pids,freezer}
+          # 同时补回 CGROUP_SCHED：基线只有 CFS_BANDWIDTH=y 却缺它，
+          # 而 CGROUP_SCHED 是 menuconfig 且 default n，缺失会让 CFS_BANDWIDTH 被静默丢弃
+          CONFIG_CGROUP_SCHED=y
+          CONFIG_FAIR_GROUP_SCHED=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_CGROUP_PIDS=y
+          # --- 必需：seccomp（dockerd 默认给容器套用 seccomp profile）---
+          CONFIG_SECCOMP_FILTER=y
+          # --- 必需：docker0 bridge + iptables(legacy) ---
+          # dockerd 建默认网桥时执行 -m addrtype --dst-type LOCAL，缺它则启动即失败
+          CONFIG_NETFILTER_XTABLES=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+          CONFIG_BRIDGE_NETFILTER=y
+          # --- 可选：容器 IPv6 与 -p 端口映射（docker 默认 --ipv6=false）---
+          CONFIG_IP6_NF_NAT=y
+          CONFIG_IP6_NF_TARGET_MASQUERADE=y
+          # --- 可选：macvlan / ipvlan 自定义网络 ---
+          CONFIG_MACVLAN=y
+          CONFIG_IPVLAN=y
+          # --- 保持 KernelSU 关闭（本机 root 方案是 Magisk）---
+          # CONFIG_KSU is not set
+          # --- 不启用 USER_NS：rootful dockerd 不需要它，
+          #     开启会把 user namespace 的攻击面暴露给所有非特权进程（安全退步）。
+          #     仅当需要 --userns-remap / rootless 时才改为 y ---
+          # CONFIG_USER_NS is not set
+          KCONFIG
+          echo "=== 已追加的 Docker 相关配置 ==="
+          tail -n 45 arch/arm64/configs/alioth_kosminor_defconfig
+
       - name: Build Kernel
         run: |
           export LOCALVERSION=${{ steps.get-tag.outputs.TAG_NAME }}
@@ -68,6 +118,27 @@ jobs:
           export CLANG_TRIPLE="aarch64-linux-gnu-"
           export CROSS_COMPILE="aarch64-linux-android-"
           make O=out alioth_kosminor_defconfig
+
+          # ---- 强制校验：确认关键配置真的落在 out/.config 里 ----
+          # Kconfig 会静默丢弃「符号名写错」或「依赖链不满足」的项，
+          # 这一步把问题挡在编译之前，避免编完刷机才发现没生效
+          REQUIRED="PID_NS IPC_NS POSIX_MQUEUE SYSVIPC CGROUP_SCHED FAIR_GROUP_SCHED CGROUP_DEVICE CGROUP_PIDS SECCOMP_FILTER BRIDGE_NETFILTER NETFILTER_XT_MATCH_ADDRTYPE"
+          MISSING=""
+          echo "--- 关键配置实际状态（读取 out/.config，不是 defconfig）---"
+          for s in $REQUIRED; do
+            if grep -q "^CONFIG_${s}=y$" out/.config; then
+              printf '  OK   %s\n' "$s"
+            else
+              printf '  FAIL %s\n' "$s"
+              MISSING="$MISSING $s"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::以下编译参数未生效（符号名错误或依赖不满足）:$MISSING"
+            exit 1
+          fi
+          echo "=== 配置校验通过，开始编译 ==="
+
           make -j$(nproc --all) O=out 2>&1
 
       - name: Pack Kernel
@@ -79,10 +150,18 @@ jobs:
           cp Image.gz-dtb android/Installer/
           cp out/arch/arm64/boot/dtbo.img android/Installer/
           sed -i '/description/ s/$/ Just installed KosminorKernel Alioth version: ${{ steps.get-tag.outputs.TAG_NAME }}/' android/Installer/module.prop
-          
+
       - name: Upload Kernel Package
         uses: actions/upload-artifact@v4
         with:
           name: KosminorKernel_Alioth_${{ steps.get-tag.outputs.TAG_NAME }}_Installer_${{ env.BUILD_TIME }}
           path: android/Installer/*
-          
+
+      # 留档最终 .config，便于事后核对 / 刷机后用 check-config.sh 比对
+      - name: Upload Kernel Config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KosminorKernel_Alioth_${{ steps.get-tag.outputs.TAG_NAME }}_config_${{ env.BUILD_TIME }}
+          path: out/.config
+          if-no-files-found: warn
