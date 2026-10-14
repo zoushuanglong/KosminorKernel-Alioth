@@ -97,6 +97,19 @@ jobs:
           #     开启会把 user namespace 的攻击面暴露给所有非特权进程（安全退步）。
           #     仅当需要 --userns-remap / rootless 时才改为 y ---
           # CONFIG_USER_NS is not set
+          #
+          # --- 方案A：排查「运行容器即内核 panic」---
+          # 实测现象：docker run 时 runc 调用 prctl(PR_SET_NAME)，
+          #   在 __set_task_comm -> strcmp 上取空指针（fault addr 0x880）而 panic。
+          # 判断依据：
+          #   1) SCHED_BORE 的代码正位于每次开机都会告警的 update_curr() 里
+          #      （WARNING: !entity_is_task(se) @ kernel/sched/fair.c task_of()）
+          #   2) PERF_HUMANTASK 是小米自定义调度钩子，在 __enqueue_entity 里
+          #      直接改写 se->vruntime = tsk->human_task * 1000000
+          # 两者代码均在 #ifdef 内，关掉可干净编译；且均无 select 依赖，
+          # 追加到 defconfig 末尾即可覆盖。
+          # CONFIG_SCHED_BORE is not set
+          # CONFIG_PERF_HUMANTASK is not set
           KCONFIG
           echo "=== 已追加的 Docker 相关配置 ==="
           tail -n 45 arch/arm64/configs/alioth_kosminor_defconfig
@@ -123,8 +136,10 @@ jobs:
           # Kconfig 会静默丢弃「符号名写错」或「依赖链不满足」的项，
           # 这一步把问题挡在编译之前，避免编完刷机才发现没生效
           REQUIRED="PID_NS IPC_NS POSIX_MQUEUE SYSVIPC CGROUP_SCHED FAIR_GROUP_SCHED CGROUP_DEVICE CGROUP_PIDS SECCOMP_FILTER BRIDGE_NETFILTER NETFILTER_XT_MATCH_ADDRTYPE"
+          MUST_BE_OFF="SCHED_BORE PERF_HUMANTASK USER_NS KSU"
           MISSING=""
-          echo "--- 关键配置实际状态（读取 out/.config，不是 defconfig）---"
+          WRONGLY_ON=""
+          echo "--- 必须开启的配置 ---"
           for s in $REQUIRED; do
             if grep -q "^CONFIG_${s}=y$" out/.config; then
               printf '  OK   %s\n' "$s"
@@ -133,8 +148,21 @@ jobs:
               MISSING="$MISSING $s"
             fi
           done
+          echo "--- 必须关闭的配置 ---"
+          for s in $MUST_BE_OFF; do
+            if grep -q "^# CONFIG_${s} is not set$" out/.config; then
+              printf '  OK   %s 已关闭\n' "$s"
+            else
+              printf '  FAIL %s 仍为开启\n' "$s"
+              WRONGLY_ON="$WRONGLY_ON $s"
+            fi
+          done
           if [ -n "$MISSING" ]; then
             echo "::error::以下编译参数未生效（符号名错误或依赖不满足）:$MISSING"
+            exit 1
+          fi
+          if [ -n "$WRONGLY_ON" ]; then
+            echo "::error::以下参数应当关闭但仍被启用:$WRONGLY_ON"
             exit 1
           fi
           echo "=== 配置校验通过，开始编译 ==="
